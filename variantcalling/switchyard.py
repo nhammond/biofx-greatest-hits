@@ -1,19 +1,16 @@
 #!/usr/bin/env python
 
 """
-switchyard takes short reads from a given genomic interval
+Switchyard takes short reads from a given genomic interval
 and performs local reassembly creating a read-aware debruijn
 graph. Read continuity is used to select a set of reasonable
 paths that traverse the interval. Paths are assumed to contain
 the read entirely, although ends may be trimmed based on
 base quality.
 
-After generating a set of possible haplotypes corresponding to
-these paths, switchyard re-aligns the reads using each haplotype
-as reference, then scores each haplotype based on attributes of
-the alignment (e.g. depth and uniformity of coverage).
-
-The best possible genotype is then selected based on score.
+Switchyard then scores each path (haplotype) based on attributes of
+the path and its read coverage (e.g. edge weight, number of duplicate
+reads, path length). Genotype is then inferred using haplotype scores.
 """
 
 import copy
@@ -21,7 +18,9 @@ import uuid
 
 REFERENCE_SAMPLE_ID = -1
 REFERENCE_STRAND_ID = -1
-DEFAULT_KMER_SIZE = 9
+
+DEFAULT_KMER_SIZE = 7
+DEFAULT_MAX_PATH_LENGTH = 1000
 
 
 class Node:
@@ -42,11 +41,12 @@ class Node:
     def addoutgoingedge(self, edge):
         self.outgoingedges.add(edge)
 
-    def getstartingstrandedges(self):
+    def getstartingstrandedges(self, sampleids=None):
         # Strand edges that start on this node, grouped by edge
         newstarts = {}
         for edge in self.outgoingedges:
-            newstarts[edge] = edge.getstartingstrandedges()
+            newstarts[edge] = edge.getstartingstrandedges(
+                sampleids=sampleids)
         return newstarts
 
 
@@ -62,14 +62,27 @@ class Edge:
         self.tonode.addincomingedge(self)
         self.strandedges = set()
 
-    def getweight(self):
-        return len(self.strandedges)
+    def getweight(self, sampleids=None):
+        return len(self.getstrandedges(sampleids=sampleids))
 
-    def getstartingstrandedges(self):
+    def getstrandedges(self, sampleids=None):
+        if sampleids:
+            return filter(
+                lambda e: e.strand.sampleid in sampleids,
+                self.strandedges)
+        else:
+            return self.strandedges
+
+    def getstartingstrandedges(self, sampleids=None):
         # Strand edges that begin on this edge
-        return set(filter(
+        startingstrandedges = set(filter(
             lambda e: e.previousstrandedge is None,
             self.strandedges))
+        if sampleids:
+            startingstrandedges = filter(
+                lambda e: e.strand.sampleid in sampleids,
+                startingstrandedges)
+        return startingstrandedges
 
     def getsequenceletter(self):
         return self.tonode.kminus1mer[-1]
@@ -79,16 +92,12 @@ class Strand:
     """A Strand is a collection of StrandEdges that represent the path
     a single strand (or graphed sequence) takes through the graph.
     """
-    idcounter = 0
-
     def __init__(self, strandid, sampleid):
         self.strandid = strandid
         self.sampleid = sampleid
         self.edgecount = 0
         self.firststrandedge = None
         self.laststrandedge = None
-        self.strandid = self.idcounter
-        Strand.idcounter += 1
 
     def getfirstnode(self):
         if self.firststrandedge:
@@ -132,6 +141,7 @@ class Graph:
         self.strands = {}
         self.nodes = {}
         self.edges = {}
+        self.sampleids = set()
         if referencesequence:
             self.referencestrand = self.createstrand(
                 referencesequence, REFERENCE_STRAND_ID, REFERENCE_SAMPLE_ID)
@@ -165,6 +175,7 @@ class Graph:
                 "lastnode undefined because no reference strand is set.")
 
     def createstrand(self, sequence, strandid, sampleid):
+        self.sampleids.add(sampleid)
         strand = Strand(strandid, sampleid)
         self.strands[strandid] = strand
         previous = None
@@ -259,7 +270,7 @@ class StrandBundle:
         self.node = node
         self.strandedges = strandedges  # should be a set, may be empty
 
-    def getdepth(self):
+    def getweight(self):
         return len(self.strandedges)
 
     def getnextedges(self, prune=True):
@@ -277,9 +288,20 @@ class StrandBundle:
         if prune:
             # Remove edges with no strands
             for edge, strandedges in nextstrandedges.items():
-                if strandedges.getdepth() == 0:
+                if strandedges.getweight() == 0:
                     del nextstrandedges[edge]
         return nextstrandedges
+
+    def getweighthistory(self):
+        strandedges = self.strandedges
+        weighthistory = []
+        while len(strandedges) > 0:
+            strandedges = filter(
+                lambda e: e is not None,
+                map(lambda e: e.previousstrandedge,
+                    strandedges))
+            weighthistory.append(len(strandedges))
+        return weighthistory
 
     def addstrandedges(self, strandedges):
         self.strandedges.update(strandedges)
@@ -293,29 +315,34 @@ class StrandBundle:
 
 
 class PathNode:
-    def __init__(self, edge, depth):
+    def __init__(self, edge, weight):
         self.edge = edge
-        self.depth = depth
+        self.weight = weight
 
 
 class Path:
     class ReachedMaxPathLength(Exception):
         pass
 
-    def __init__(self, nodelist=None, maxpathlength=1000):
-        if nodelist is None:
+    def __init__(self, edges=None, maxpathlength=None):
+        if edges is None:
             self.nodelist = []
         else:
-            self.nodelist = copy.copy(nodelist)
+            self.nodelist = [PathNode(edge, 0) for edge in edges]
         self.maxpathlength = maxpathlength
 
-    def addedge(self, edge, depth):
-        if len(self.nodelist) == self.maxpathlength:
+    def addedge(self, edge, weight=0):
+        if self.maxpathlength and len(self.nodelist) >= self.maxpathlength:
             raise self.ReachedMaxPathLength
-        self.nodelist.append(PathNode(edge, depth))
+        self.nodelist.append(PathNode(edge, weight))
 
     def clone(self):
-        return Path(nodelist=self.nodelist)
+        clone = Path(maxpathlength=self.maxpathlength)
+        clone.nodelist = copy.copy(self.nodelist)
+        return clone
+
+    def getlength(self):
+        return len(self.nodelist)
 
     def getscore(self):
         pass
@@ -328,29 +355,111 @@ class Path:
             sequence += node.edge.getsequenceletter()
         return sequence
 
+    def getweights(self):
+        return [node.weight for node in self.nodelist]
+
+    def adjustweightforaddedstrands(self, bundle):
+        # Current step is already accounted for.
+        # Add weight for history of bundle.
+        counter = -1
+        for weight in bundle.getweighthistory():
+            self.nodelist[counter].weight += weight
+            counter -= 1
+
+    def endswith(self, path):
+        if self.getlength() < path.getlength():
+            return False
+        for i in range(1, path.getlength()+1):
+            if path.nodelist[-i].edge is not self.nodelist[-i].edge:
+                return False
+        return True
+
 
 class PathFinder:
 
-    def __init__(self, graph, minimumoverlap=None):
+    def __init__(self, graph, minimumoverlap=None, anchorlength=None,
+                 maxpathlength=DEFAULT_MAX_PATH_LENGTH, excludedsamples=None,
+                 includedsamples=None):
+
         self.graph = graph
+        kmersize = self.graph.kmersize
         if minimumoverlap is None:
-            self.minimumoverlap = self.graph.getmedianstrandedgecount() * 0.5
-        else:
-            self.minimumoverlap = minimumoverlap
-        self.firstnode = self.graph.getfirstnode()
-        self.lastnode = self.graph.getlastnode()
+            minimumoverlap = self.graph.getmedianstrandedgecount() * 0.5 \
+                             + kmersize - 1
+        if minimumoverlap < kmersize:
+            raise Exception('Minimum overlap must be at least kmersize.'
+                            'minimumoverlap=%s, kmersize=%s.' %
+                            (minimumoverlap, kmersize))
+        self.minimumoverlapedges = int(minimumoverlap - kmersize + 1)
+        if anchorlength is None:
+            anchorlength = self.graph.kmersize
+        if anchorlength < kmersize:
+            raise Exception('Anchor length must be at least kmersize.'
+                            'anchorlength=%s, kmersize=%s.' %
+                            (anchorlength, kmersize))
+        self.anchorlength = anchorlength
+        self.maxpathlength = maxpathlength
+        self._initializeterminalpath()
         self.paths = []
+        if excludedsamples is not None and includedsamples is not None:
+            raise Exception(
+                "Cannot specify both includedsamples and excludedsamples")
+        if includedsamples is not None:
+            self.includedsamples = includedsamples
+        else:
+            if excludedsamples is None:
+                excludedsamples = [-1]
+            self.includedsamples = self.graph.sampleids.difference(
+                excludedsamples)
 
     def getpaths(self):
-        for edge in self.firstnode.outgoingedges:
-            guidestrands = StrandBundle(edge.tonode, edge.strandedges)
-            overlappingstrands = StrandBundle(
-                edge.tonode, set())  # Initially empty
-            path = Path()
-            path.addedge(edge, guidestrands.getdepth())
-            self._scan(
-                guidestrands, overlappingstrands, path)
+        guidestrands, overlappingstrands, path = self._getstartanchorpath()
+        self._scan(guidestrands, overlappingstrands, path)
         return self.paths
+
+    def _initializeterminalpath(self):
+        # Save the end of the reference path. We will compare this
+        # to the paths we traverse to know when we reach the end,
+        # as determined by an overlap of anchorlength or more.
+        terminaledges = []
+        referencestrandedge = self.graph.referencestrand.laststrandedge
+        for i in range(self.anchorlength - self.graph.kmersize + 1):
+            terminaledges.insert(0, referencestrandedge.edge)
+            referencestrandedge = referencestrandedge.previousstrandedge
+            if referencestrandedge is None:
+                raise Exception(
+                    "Reference strand cannot be shorter than anchor length")
+        self.terminalpath = Path(terminaledges)
+
+    def _getstartanchorpath(self):
+        anchoredges = self.anchorlength - self.graph.kmersize + 1
+        referencestrandedge = self.graph.referencestrand.firststrandedge
+        guidestrands, overlappingstrands, path = self._initializepath(
+            referencestrandedge.edge)
+        for i in range(anchoredges - 1):
+            referencestrandedge = referencestrandedge.nextstrandedge
+            assert referencestrandedge is not None, \
+                "Reference strand cannot be shorter than anchor length"
+            nextguidestrands, nextoverlappingstrands = self._getnext(
+                guidestrands, overlappingstrands)
+            try:
+                guidestrands, overlappingstrands = self._followedge(
+                    nextguidestrands, nextoverlappingstrands,
+                    referencestrandedge.edge, path)
+            except path.ReachedMaxPathLength:
+                raise Exception(
+                    "Max path length cannot be less than anchor length")
+        return guidestrands, overlappingstrands, path
+
+    def _initializepath(self, edge):
+        guidestrands = StrandBundle(
+            edge.tonode,
+            edge.getstrandedges(sampleids=self.includedsamples))
+        overlappingstrands = StrandBundle(
+            edge.tonode, set())  # Initially empty
+        path = Path(maxpathlength=self.maxpathlength)
+        path.addedge(edge, weight=guidestrands.getweight())
+        return guidestrands, overlappingstrands, path
 
     def _scan(self, guidestrands, overlappingstrands, path):
         # We follow guidestrands as long as they follow the same path.
@@ -360,19 +469,21 @@ class PathFinder:
 
         # Loop until the guidestrands fork or until dead end
         while True:
-            # Save the path when we hit lastnode.
+            # Save the path when we hit the end.
             # We may still continue to find paths that
-            # contain the lastnode more than once.
-            if guidestrands.node is self.lastnode:
-                self.paths.append(path.clone())
+            # contain this terminus more than once.
+            if path.endswith(self.terminalpath):
+                # First add overlap strands to weights, to be consistent
+                # with weight at start node, which included all strands
+                # without respect to minimum overlap
+                completedpath = path.clone()
+                completedpath.adjustweightforaddedstrands(
+                    overlappingstrands)
+                self.paths.append(completedpath)
 
-            nextguidestrands = guidestrands.getnextedges()
+            nextguidestrands, nextoverlappingstrands = self._getnext(
+                guidestrands, overlappingstrands)
             nextedges = nextguidestrands.keys()
-            nextoverlappingstrands = overlappingstrands.getnextedges(
-                prune=False)
-            newstarts = guidestrands.node.getstartingstrandedges()
-            for edge, bundle in nextoverlappingstrands.iteritems():
-                bundle.addstrandedges(newstarts[edge])
 
             if len(nextedges) == 0:
                 # Dead end
@@ -381,39 +492,55 @@ class PathFinder:
             if len(nextedges) == 1:
                 # Step forward one edge
                 edge = nextedges.pop()
-                guidestrands = nextguidestrands[edge]
-                overlappingstrands = nextoverlappingstrands[edge]
-                # if any overlappingstrands have reached the
-                # overlap threshold, add them to the guidestrands
-                newguidestrands = overlappingstrands.popifoverlapexceeds(
-                    self.minimumoverlap)
-                guidestrands.addstrandedges(newguidestrands)
                 try:
-                    path.addedge(edge, guidestrands.getdepth())
-                except ReachedMaxPathLength:
+                    guidestrands, overlappingstrands = self._followedge(
+                        nextguidestrands, nextoverlappingstrands, edge, path)
+                except path.ReachedMaxPathLength:
                     return
                 continue
 
             else:
                 # Guidestrands are splitting. Recurse to follow each path.
-                for edge, guidestrands in nextguidestrands.iteritems():
-                    overlappingstrands = nextoverlappingstrands.get(edge)
-                    # if any overlappingstrands have reached the
-                    # overlap threshold, add them to the guidestrands
-                    newguidestrands = overlappingstrands.popifoverlapexceeds(
-                        self.minimumoverlap)
-                    guidestrands.addstrandedges(newguidestrands)
-                    newpath = path.clone()
+                for edge in nextguidestrands:
+                    splitpath = path.clone()
                     try:
-                        newpath.addedge(edge, guidestrands.getdepth())
-                    except newpath.ReachedMaxPathLength:
+                        guidestrands, overlappingstrands = self._followedge(
+                            nextguidestrands, nextoverlappingstrands,
+                            edge, splitpath)
+                    except path.ReachedMaxPathLength:
                         return
-                    self._scan(guidestrands, overlappingstrands, newpath)
+                    self._scan(guidestrands, overlappingstrands, splitpath)
                 return
+
+    def _followedge(self, nextguidestrands, nextoverlappingstrands,
+                    edge, path):
+        guidestrands = nextguidestrands[edge]
+        overlappingstrands = nextoverlappingstrands[edge]
+        # if any overlappingstrands have reached the
+        # overlap threshold, add them to the guidestrands
+        newguidestrands = overlappingstrands.popifoverlapexceeds(
+            self.minimumoverlapedges)
+        guidestrands.addstrandedges(newguidestrands)
+        path.adjustweightforaddedstrands(
+            StrandBundle(edge.tonode, newguidestrands))
+        path.addedge(edge, weight=guidestrands.getweight())
+        return guidestrands, overlappingstrands
+
+    def _getnext(self, guidestrands, overlappingstrands):
+        nextguidestrands = guidestrands.getnextedges()
+        nextoverlappingstrands = overlappingstrands.getnextedges(
+            prune=False)
+        newstarts = guidestrands.node.getstartingstrandedges(
+            sampleids=self.includedsamples)
+        for edge, bundle in nextoverlappingstrands.iteritems():
+            bundle.addstrandedges(newstarts[edge])
+        return nextguidestrands, nextoverlappingstrands
 
 
 if __name__ == '__main__':
     ref = 'agagtcgctacttatcgtgtctaactaatgggtacttcagctcaagagat'
+    graph = Graph(ref)
+
     # MNP complicates the graph by creating a 2nd loop to tactt
     altseq = 'agagtcgctacttatcgtgtctacttaatgggtacttcagctcaagagat'
     # splits on first step
@@ -421,32 +548,28 @@ if __name__ == '__main__':
     # splits on second step
     altseq2 = 'agagtcgatacttatcgtgtctaactaatgggtacttcagctcaagagat'
     altseq3 = 'agcggcgcaacatgtcttgtctactataggtgttcatcaactgagaatac'
-    # Merge from stray path
-    altseq4 = 'cttgccgctacttatcgtgtctaactaatgggtacttcagctcaagagat'
 
-    # This sample is het reference. Build some reads out of both
-    # sequences.
-
-    readlength = 10
-    kmersize = 7
-    sampleid = 1
-
-    def getreadsandids(sequence, readlength):
+    def getreadsandids(sequence):
+        readlength = 10
         readidpairs = []
         for i in xrange(len(sequence) - readlength + 1):
             readidpairs.append((str(uuid.uuid4()), sequence[i:i+readlength]))
         return readidpairs
-    readidpairs = getreadsandids(ref, readlength)
-    readidpairs.extend(getreadsandids(altseq, readlength))
-    readidpairs.extend(getreadsandids(altseq1, readlength))
-    readidpairs.extend(getreadsandids(altseq2, readlength))
-    readidpairs.extend(getreadsandids(altseq3, readlength))
-    readidpairs.extend(getreadsandids(altseq4, readlength))
 
-    graph = Graph(ref, kmersize=kmersize)
-    graph.saveimage('ref')
-    graph.addsequences(readidpairs, sampleid=sampleid)
+    graph.addsequences(getreadsandids(ref), sampleid=1)
+    graph.addsequences(getreadsandids(altseq), sampleid=1)
+    graph.addsequences(getreadsandids(altseq1), sampleid=2)
+    graph.addsequences(getreadsandids(altseq2), sampleid=2)
+    graph.addsequences(getreadsandids(altseq3), sampleid=1)
+
     graph.saveimage('test')
     paths = PathFinder(graph).getpaths()
     for path in paths:
+        weights = path.getweights()
+        averageweight = sum(weights)/float(len(weights))
+        diffsquared = [(weight-averageweight)**2 for weight in weights]
+        stdev = (sum(diffsquared)/float(len(diffsquared)))**(1/2.0)
+        minweight = min(weights)
         print path.getsequence()
+        print "Edge weights: avg=%s, min=%s, stdev=%s" % (
+            averageweight, minweight, stdev)
